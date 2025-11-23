@@ -1,0 +1,4 @@
+chromadb
+ollama
+aiogram
+python-dotenv
