@@ -1,3 +1,5 @@
+youtube-transcript-api
+trafilatura
 beautifulsoup4
 requests
 chromadb
