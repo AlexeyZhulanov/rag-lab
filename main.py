@@ -102,26 +102,42 @@ def generate_quiz_json(text):
         return None
 
 
+def split_text(text, chunk_size=1000, overlap=100):
+    """Режет текст на куски по chunk_size символов с перекрытием"""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        # overlap нужен, чтобы не разрезать важную мысль посередине
+        start += (chunk_size - overlap)
+    return chunks
+
+
 def save_article_to_db(url, title, text, summary_block):
     """Сохраняет статью и её векторы в базу"""
+    # 1. Режем текст
+    chunks = split_text(text)
 
-    # Генерируем вектор для поиска
-    # Важно: мы векторизуем ПОЛНЫЙ текст, чтобы искать по смыслу внутри статьи
-    emb_response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+    print(f"Сохраняю {len(chunks)} фрагментов для: {title}")
 
-    # Сохраняем в ChromaDB
-    # ID документа будет его URL (чтобы не сохранять дважды одно и то же)
-    collection.upsert(
-        ids=[url],
-        documents=[text],
-        embeddings=[emb_response["embedding"]],
-        metadatas=[{
-            "title": title,
-            "url": url,
-            "summary": summary_block,
-            "date_added": datetime.datetime.now().strftime("%Y-%m-%d")
-        }]
-    )
+    # 2. Сохраняем каждый кусок отдельно
+    for i, chunk in enumerate(chunks):
+        # Генерируем вектор для КУСКА, а не всего текста
+        emb_response = ollama.embeddings(model=EMBED_MODEL, prompt=chunk)
+
+        collection.upsert(
+            ids=[f"{url}_{i}"],  # Уникальный ID для куска
+            documents=[chunk],
+            embeddings=[emb_response["embedding"]],
+            metadatas=[{
+                "title": title,
+                "url": url,
+                "summary": summary_block,  # Саммари у всех кусков одинаковое
+                "chunk_id": i,
+                "date_added": datetime.datetime.now().strftime("%Y-%m-%d")
+            }]
+        )
 
 
 def get_random_article():
@@ -139,21 +155,25 @@ def get_random_article():
 
 def search_in_db(query):
     """Ищет ответ в базе данных"""
-    # 1. Векторизуем вопрос
+    # Векторизуем вопрос
     query_emb = ollama.embeddings(model=EMBED_MODEL, prompt=query)["embedding"]
 
-    # 2. Ищем 3 самых похожих куска
+    # Берем ТОП-3 результата
     results = collection.query(
         query_embeddings=[query_emb],
-        n_results=1
+        n_results=3
     )
 
     if not results['documents'] or not results['documents'][0]:
         return None, None
 
-    found_text = results['documents'][0][0]
-    metadata = results['metadatas'][0][0]
-    return found_text, metadata
+    # Собираем тексты всех 3-х найденных кусков в одну строку
+    found_texts = results['documents'][0] # Это список ['текст1', 'текст2', 'текст3']
+    metadatas = results['metadatas'][0]
+
+    # Возвращаем склеенный текст и метаданные первого (самого релевантного) источника
+    combined_text = "\n---\n".join(found_texts)
+    return combined_text, metadatas[0]
 
 
 # --- ХЕНДЛЕРЫ TELEGRAM ---
@@ -342,11 +362,14 @@ async def handle_question(message: types.Message):
 
     # 2. Формируем ответ через LLM
     prompt = f"""
-    Используй контекст статьи, чтобы ответить на вопрос.
-    Статья: "{meta['title']}"
+    Ты — умный помощник. Ответь на вопрос пользователя, основываясь ТОЛЬКО на контексте ниже.
+    Контекст может содержать несколько отрывков из разных источников.
+
+    ВАЖНО: Если в контексте нет точного ответа на вопрос, ответь: "В моих сохраненных материалах нет информации об этом". 
+    Не пытайся отвечать своими знаниями.
 
     Контекст:
-    {found_text[:3000]}
+    {found_text}
 
     Вопрос: {user_text}
     """
