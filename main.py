@@ -5,13 +5,13 @@ import os
 import datetime
 import ollama
 import chromadb
-import random
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from parsers import parse_web_page, parse_youtube
 
 
@@ -34,7 +34,9 @@ collection = chroma_client.get_or_create_collection(name="articles_knowledge")
 
 # --- МАШИНА СОСТОЯНИЙ (FSM) ---
 class QuizState(StatesGroup):
-    waiting_for_answer = State() # Ждем, пока юзер нажмет кнопку
+    waiting_for_article_choice = State() # Выбор статьи
+    waiting_for_count_choice = State()   # Выбор количества вопросов
+    waiting_for_answer = State()         # Сама игра
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -68,7 +70,7 @@ def generate_summary(text):
     return response['message']['content']
 
 
-def generate_quiz_json(text):
+def generate_quiz_json(text, num_questions):
     """
     Генерирует вопросы по тексту и возвращает их как Python-список.
     """
@@ -77,24 +79,22 @@ def generate_quiz_json(text):
 
     # Жесткий промпт, чтобы получить чистый JSON
     prompt = f"""
-    Проанализируй текст и создай 3 вопроса для викторины с вариантами ответов.
-    Ты должен вернуть ТОЛЬКО валидный JSON массив, без лишнего текста, без markdown (```json).
+        Проанализируй текст и создай ровно {num_questions} вопросов для викторины с вариантами ответов.
+        Каждый вопрос должен начинаться с заглавной буквы.
+        Ты должен вернуть ТОЛЬКО валидный JSON массив.
 
-    Формат JSON:
-    [
-      {{
-        "question": "Текст вопроса 1?",
-        "options": ["Вариант А", "Вариант Б", "Вариант В"],
-        "correct_index": 0 
-      }},
-      ...
-    ]
+        Формат JSON:
+        [
+          {{
+            "question": "Текст вопроса?",
+            "options": ["А", "Б", "В", "Г"],
+            "correct_index": 0 
+          }}
+        ]
 
-    Примечание: correct_index - это номер правильного ответа в массиве options (начиная с 0).
-
-    Текст статьи:
-    {safe_text}
-    """
+        Текст:
+        {safe_text} 
+        """
 
     response = ollama.chat(model=CHAT_MODEL, messages=[{'role': 'user', 'content': prompt}],
         options={
@@ -154,17 +154,16 @@ def save_article_to_db(url, title, text, summary_block):
         )
 
 
-def get_random_article():
-    """Берет случайную статью из базы"""
-    data = collection.get()
-    if not data['documents']:
-        return None, None
-
-    # Выбираем случайный индекс
-    idx = random.randint(0, len(data['documents']) - 1)
-    text = data['documents'][idx]
-    title = data['metadatas'][idx]['title']
-    return title, text
+def get_unique_articles():
+    """Возвращает список уникальных статей (title, url)"""
+    data = collection.get(limit=100, include=['metadatas'])
+    unique = {}
+    if data['metadatas']:
+        for meta in data['metadatas']:
+            url = meta.get('url')
+            if url and url not in unique:
+                unique[url] = meta.get('title', 'Без названия')
+    return unique # Словарь {url: title}
 
 
 def search_in_db(query):
@@ -189,6 +188,19 @@ def search_in_db(query):
     combined_text = "\n---\n".join(found_texts)
     return combined_text, metadatas[0]
 
+
+def get_full_text_by_url(target_url):
+    """Собирает полный текст статьи из всех её чанков"""
+    # Ищем все записи с этим URL
+    data = collection.get(where={"url": target_url})
+    if not data['documents']:
+        return ""
+
+    # Сортируем документы по chunk_id
+    sorted_docs = [doc for _, doc in sorted(zip(data['metadatas'], data['documents']), key=lambda pair: pair[0].get('chunk_id', 0))]
+
+    full_text = "\n".join(sorted_docs)
+    return full_text
 
 # --- ХЕНДЛЕРЫ TELEGRAM ---
 
@@ -233,36 +245,81 @@ async def cmd_report(message: types.Message):
     await message.answer(report_text, parse_mode="None")  # parse_mode=None чтобы ссылки не ломали разметку
 
 
+# 1. Запуск: Показываем список статей
 @dp.message(Command("quiz"))
-async def start_quiz(message: types.Message, state: FSMContext):
-    """Начинает викторину"""
-    await message.answer("🎲 Ищу статью и генерирую вопросы... (это займет секунд 10)")
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+async def start_quiz_selection(message: types.Message, state: FSMContext):
+    articles = await asyncio.to_thread(get_unique_articles)
 
-    # 1. Берем статью
-    title, text = await asyncio.to_thread(get_random_article)
-    if not title:
-        await message.answer("Сначала сохрани хотя бы одну статью!")
+    if not articles:
+        await message.answer("📭 База знаний пуста. Сначала скинь ссылку!")
         return
 
-    # 2. Генерируем вопросы через LLM
-    quiz_data = await asyncio.to_thread(generate_quiz_json, text)
+    # Сохраняем словарь статей в состояние, чтобы потом найти URL по индексу
+    # (В кнопках нельзя передавать длинные URL)
+    articles_list = list(articles.items())  # [ (url1, title1), (url2, title2) ]
+    await state.set_state(QuizState.waiting_for_article_choice)
+    await state.update_data(articles_list=articles_list)
+
+    # Создаем кнопки
+    builder = InlineKeyboardBuilder()
+    for i, (url, title) in enumerate(articles_list):
+        # Обрезаем название, если слишком длинное
+        btn_text = title[:40] + "..." if len(title) > 40 else title
+        builder.button(text=btn_text, callback_data=f"q_art_{i}")
+
+    builder.adjust(1)  # По 1 кнопке в ряд
+    await message.answer("📚 Выбери материал для теста:", reply_markup=builder.as_markup())
+
+
+# 2. Обработка выбора статьи -> Показ выбора количества
+@dp.callback_query(QuizState.waiting_for_article_choice, F.data.startswith("q_art_"))
+async def quiz_article_chosen(callback: types.CallbackQuery, state: FSMContext):
+    # Получаем индекс выбранной статьи
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    articles_list = data['articles_list']
+
+    selected_url, selected_title = articles_list[index]
+
+    # Сохраняем выбор
+    await state.update_data(selected_url=selected_url, selected_title=selected_title)
+
+    # Рисуем кнопки кол-ва вопросов
+    builder = InlineKeyboardBuilder()
+    builder.button(text="3 вопроса", callback_data="q_cnt_3")
+    builder.button(text="5 вопросов", callback_data="q_cnt_5")
+    builder.button(text="7 вопросов", callback_data="q_cnt_7")
+
+    await state.set_state(QuizState.waiting_for_count_choice)
+    await callback.message.edit_text(f"Выбрано: **{selected_title}**\nСколько вопросов задать?", parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+# 3. Обработка количества -> Генерация -> Старт
+@dp.callback_query(QuizState.waiting_for_count_choice, F.data.startswith("q_cnt_"))
+async def quiz_count_chosen(callback: types.CallbackQuery, state: FSMContext):
+    num_questions = int(callback.data.split("_")[-1])
+
+    data = await state.get_data()
+    url = data['selected_url']
+    title = data['selected_title']
+
+    await callback.message.edit_text(f"🎲 Генерирую {num_questions} вопросов по теме \"{title}\"...\n(Жди, читаю базу...)")
+
+    # Собираем текст и генерируем (в потоке)
+    full_text = await asyncio.to_thread(get_full_text_by_url, url)
+    quiz_data = await asyncio.to_thread(generate_quiz_json, full_text, num_questions)
 
     if not quiz_data:
-        await message.answer("❌ Не удалось сгенерировать вопросы. Попробуй еще раз.")
+        await callback.message.edit_text("❌ Ошибка генерации. LLM подвела. Попробуй еще раз.")
+        await state.clear()
         return
 
-    # 3. Сохраняем состояние (текущие вопросы, счетчик)
+    # Настраиваем игру
     await state.set_state(QuizState.waiting_for_answer)
-    await state.update_data(
-        quiz_data=quiz_data,
-        current_q=0,
-        score=0,
-        article_title=title
-    )
+    await state.update_data(quiz_data=quiz_data, current_q=0, score=0)
 
-    # 4. Задаем первый вопрос
-    await ask_question(message, quiz_data[0], 0, title)
+    # Задаем первый вопрос
+    await ask_question(callback.message, quiz_data[0], 0, title)
 
 
 async def ask_question(message, question_item, index, title):
@@ -310,12 +367,10 @@ async def quiz_answer_handler(callback: types.CallbackQuery, state: FSMContext):
     if next_q_index < len(quiz_data):
         # Если есть еще вопросы
         await state.update_data(current_q=next_q_index, score=score)
-        await ask_question(callback.message, quiz_data[next_q_index], next_q_index, data['article_title'])
+        await ask_question(callback.message, quiz_data[next_q_index], next_q_index, data['selected_title'])
     else:
         # Конец викторины
-        await callback.message.answer(
-            f"🏁 **Викторина завершена!**\n\nТвой результат: {score} из {len(quiz_data)}."
-        )
+        await callback.message.answer(f"🏁 **Викторина завершена!**\n\nТвой результат: {score} из {len(quiz_data)}.")
         await state.clear()  # Сбрасываем состояние
 
     await callback.answer()  # Чтобы часики на кнопке пропали
