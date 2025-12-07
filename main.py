@@ -189,6 +189,26 @@ def search_in_db(query):
     return combined_text, metadatas[0]
 
 
+@dp.callback_query(F.data.startswith("del_"))
+async def delete_article(callback: types.CallbackQuery):
+    url_index = int(callback.data.split("_")[-1])
+
+    data = collection.get(limit=100, include=['metadatas'])
+    if not data['metadatas']:
+        return
+
+    unique_urls = []
+    for meta in data['metadatas']:
+        url = meta.get('url')
+        if url and url not in unique_urls:
+            unique_urls.append(url)
+
+    target_url = unique_urls[url_index]
+
+    collection.delete(where={"url": target_url})
+    await callback.message.answer(f"✅ Статья **{target_url}** — удалена из базы.", parse_mode="Markdown")
+
+
 def get_full_text_by_url(target_url):
     """Собирает полный текст статьи из всех её чанков"""
     # Ищем все записи с этим URL
@@ -234,15 +254,22 @@ async def cmd_report(message: types.Message):
         if url not in unique_sources:
             unique_sources[url] = meta
 
-    report_text = "📊 **Отчет по сохраненным знаниям:**\n\n"
-
     # Перебираем уникальные записи
-    for url, meta in unique_sources.items():
+    for idx, (url, meta) in enumerate(unique_sources.items()):
         title = meta.get('title', 'Без названия')
         date = meta.get('date_added', '?')
-        report_text += f"🔹 **{title}**\n📅 Дата: {date}\n🔗 {url}\n\n"
-
-    await message.answer(report_text, parse_mode="None")  # parse_mode=None чтобы ссылки не ломали разметку
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="❌ Удалить", callback_data=f"del_{idx}")
+            ]
+        ])
+        text = (
+            f"🔹 <b>{title}</b>\n"
+            f"📅 Дата: {date}\n"
+            f"🔗 {url}"
+        )
+        # Отправляем каждую статью отдельным сообщением
+        await message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 
 # 1. Запуск: Показываем список статей
