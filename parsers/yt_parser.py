@@ -3,26 +3,6 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 from urllib.parse import urlparse, parse_qs
 
 
-# --- ФУНКЦИЯ ДЛЯ ВЕБ-САЙТОВ ---
-def parse_web_page(url):
-    try:
-        downloaded = trafilatura.fetch_url(url)
-        if downloaded is None:
-            return None, "Не удалось скачать страницу."
-
-        text = trafilatura.extract(downloaded)
-        metadata = trafilatura.extract_metadata(downloaded)
-        title = metadata.title if metadata and metadata.title else "Веб-статья"
-
-        if not text:
-            return None, "Текст не найден."
-
-        return title, text
-    except Exception as e:
-        return None, f"Ошибка веб-парсера: {e}"
-
-
-# --- ФУНКЦИЯ ДЛЯ YOUTUBE ---
 def extract_video_id(url):
     """Вытаскивает ID видео из ссылки"""
     # Поддерживает formats: youtube.com/watch?v=ID, youtu.be/ID
